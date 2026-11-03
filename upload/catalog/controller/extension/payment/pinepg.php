@@ -370,6 +370,13 @@ public function sendPostRequest($url, $body, $headers) {
 public function onOrderHistoryAdd($route, $args, $output) {
 
     $order_id=$args[0];
+	$comment = isset($args[2]) ? (string)$args[2] : '';
+
+	// The success history entry also dispatches this event; do not refund twice.
+	if (strpos($comment, '[PinePG Refund]') !== false) {
+		return;
+	}
+
     $this->load->model('checkout/order');
 	$this->load->model('catalog/product');
     
@@ -379,9 +386,8 @@ public function onOrderHistoryAdd($route, $args, $output) {
     
 
     
-    $this->logger->write('Order Data'. serialize($order_info));
-	if($order_info['order_status']=='Refunded'){
-      $payment_response = $this->process_refund($order_info);
+	if (!empty($order_info) && $order_info['payment_code'] === 'pinepg' && strtolower($order_info['order_status']) === 'refunded') {
+      $this->process_refund($order_info);
 	}
 	
 	
@@ -389,12 +395,16 @@ public function onOrderHistoryAdd($route, $args, $output) {
 
 
 
-public function process_refund($order_info) {
+public function process_refund($order_info, $amount = null, $reason = 'Initiated by merchant') {
 	
 
 	// Retrieve the Edge order ID from custom field or metadata
 	$this->load->model('extension/payment/pinepg');
 	$refund_order_id = $this->model_extension_payment_pinepg->getCheckoutOrderId($order_info['order_id']);
+	if (empty($refund_order_id)) {
+		$this->logger->write('Refund failed: Pine Labs order ID is missing for OpenCart order ' . (int)$order_info['order_id']);
+		return false;
+	}
 
 	// Prepare API request URL
 	$PinePgMode=$this->config->get('payment_pinepg_mode');
@@ -407,18 +417,20 @@ public function process_refund($order_info) {
 
 
 
-	$orderamount= $order_info['total'] * 100;
-
-	if (is_numeric($orderamount) && floor($orderamount) != $orderamount) {
-		$orderamount = ceil($orderamount);
+	$refund_amount = $amount === null ? (float)$order_info['total'] : (float)$amount;
+	if ($refund_amount <= 0 || $refund_amount > (float)$order_info['total']) {
+		$this->logger->write('Refund failed: invalid refund amount for OpenCart order ' . (int)$order_info['order_id']);
+		return false;
 	}
+
+	$orderamount = (int)round($refund_amount * 100);
 
 	// Prepare the request payload
 	$body = json_encode([
 		'merchant_order_reference' => uniqid(),
-		'refund_amount' => ['value' => $orderamount, 'currency' => 'INR'],
+		'order_amount' => ['value' => $orderamount, 'currency' => 'INR'],
 		'merchant_metadata' => ['key1' => 'DD', 'key2' => 'XOF'],
-		'refund_reason' => 'Initiated by merchant',
+		'refund_reason' => $reason,
 	]);
 
 	$merchant_id=$this->config->get('payment_pinepg_merchantid');
@@ -435,28 +447,26 @@ public function process_refund($order_info) {
 	// Make the API call
 	$response = $this->sendPostRequest($url, $body, $headers);
 
-$data = json_decode($response);
-$status = $data->data->status ?? null;
-$order_id = $data->data->order_id ?? null;
-$parent_order_id = $data->data->parent_order_id ?? null;
+	$data = json_decode($response);
+	$status = $data->data->status ?? null;
+	$order_id = $data->data->order_id ?? null;
+	$parent_order_id = $data->data->parent_order_id ?? null;
 
 	// Handle the response
-	if ($status === 'PROCESSED') {
+	if ($status === 'PROCESSED' && !empty($order_id)) {
 		// Add order history note for successful refund
 		    $this->load->model('checkout/order');
-			$Order_Status='11';
-			$comment='Refund successfull for order id : '.$order_info['order_id'].' ,Pinelabs Payment ID for this order is : '.$parent_order_id.' and Pinelabs Refund ID for this order is : '.$order_id;
-		    $this->model_checkout_order->addOrderHistory($order_info['order_id'], $Order_Status,$comment,false,false);
+			$order_status_id = (int)$order_info['order_status_id'];
+			$comment='[PinePG Refund] Refund successful for order ID: '.$order_info['order_id'].', Pine Labs payment ID: '.$parent_order_id.', Pine Labs refund ID: '.$order_id.', amount: '.number_format($refund_amount, 2, '.', '');
+		    $this->model_checkout_order->addOrderHistory($order_info['order_id'], $order_status_id,$comment,false,false);
 			$this->logger = new Log('pinepg_'. date("Y-m-d").'.log');
-		    $this->logger->write('Refund Data Success'. serialize($response));
+		    $this->logger->write('Refund successful for OpenCart order ' . (int)$order_info['order_id'] . ', Pine Labs refund ID ' . $order_id);
 
-		//return 'Refund successful';
+		return true;
 	} else {
-		//return 'Refund fail';
-
 		$this->logger = new Log('pinepg_'. date("Y-m-d").'.log');
-		$this->logger->write('Refund Data Fail'. serialize($response));
-		
+		$this->logger->write('Refund failed for OpenCart order ' . (int)$order_info['order_id'] . ': ' . $response);
+		return false;
 	}
 }
   
